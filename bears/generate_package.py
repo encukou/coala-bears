@@ -6,10 +6,13 @@ from string import Template
 import subprocess
 import sys
 import time
+import re
 
 from bears import VERSION
 from coalib.collecting.Importers import iimport_objects
 from coalib.parsing.Globbing import glob
+
+from coala_utils.Question import ask_question
 
 
 def touch(file_name):
@@ -37,19 +40,23 @@ def create_file_from_template(template_file, output_file, substitution_dict):
         output_handle.write(template)
 
 
-def create_file_structure_for_packages(root_folder, file_to_copy, object_name):
+def create_file_structure_for_packages(root_folder, file_to_copy,
+                                       object_name, package_type):
     """
     Creates a file structure for the packages to be uploaded. The structure
-    will be ``root_folder/object_name/object_name/file_to_copy``.
-    The file structure has two object_name folders because ``setup.py`` file
+    will be ``root_folder/object_name/object_name/file_to_copy`` for pypi
+    packages and ``root_folder/object_name/file_to_copy`` for conda packages.
+    The PyPi structure has two object_name folders because ``setup.py`` file
     needs files to be one level deeper than itself so that they can be uploaded.
 
     :param root_folder:  The folder in which the packages are going to be
                          generated.
     :param file_to_copy: The file that is going to be generated the package for.
     :param object_name:  The name of the object that is inside the file_to_copy.
+    :param package_type: The type of package, conda or PyPi.
     """
-    upload_package_folder = os.path.join(root_folder, object_name, object_name)
+    upload_package_folder = os.path.join(root_folder, object_name, object_name)\
+        if package_type == "pypi" else os.path.join(root_folder, object_name)
     os.makedirs(upload_package_folder, exist_ok=True)
     touch(os.path.join(upload_package_folder, '__init__.py'))
     shutil.copyfile(file_to_copy, os.path.join(upload_package_folder,
@@ -94,7 +101,40 @@ def create_upload_parser():
                         action='store_true')
     parser.add_argument('-u', '--upload', help='Upload the packages on PyPi',
                         action='store_true')
+    parser.add_argument('-c', '--conda', help='Create a conda package',
+                        metavar='dir')
     return parser
+
+
+def get_bear_glob(path):
+    """
+    Returns a set of filenames depending on the type of package that is to be
+    created.
+
+    :param path: Path from which to fetch the Bear if a conda package is to be
+                 created.
+    :return:     Returns a set with one filename for a conda package or a set
+                 with multiple filenames for the pypi packages.
+    """
+    return set(glob(os.path.join(path, '*Bear.py'))) if path\
+        else sorted(set(glob('bears/**/*Bear.py')))
+
+
+def fetch_url(path):
+    """
+    Checks the ``.git`` directory in ``path`` and fetches the URL of the repo.
+
+    :param path: Path in which to look for a ``.git`` directory.
+    :return:     Returns the url fetched or ``False`` if the URL could not be
+                 fetched.
+    """
+    config = os.path.join(path, '.git', 'config')
+    try:
+        with open(config, 'r') as f:
+            match = re.search(r'\s*url = (?P<url>.+)', f.read())
+            return match.group('url') if match.group('url') else False
+    except FileNotFoundError:
+        return False
 
 
 def main():
@@ -104,14 +144,21 @@ def main():
 
     nano_version = str(int(time.time()))
 
-    for bear_file_name in sorted(set(glob('bears/**/*Bear.py'))):
+    for bear_file_name in get_bear_glob(args.conda):
+
         bear_object = next(iimport_objects(
             bear_file_name, attributes='kind', local=True),
             None)
         if bear_object:
             bear_name, _ = os.path.splitext(os.path.basename(bear_file_name))
             create_file_structure_for_packages(
-                os.path.join('bears', 'upload'), bear_file_name, bear_name)
+                os.path.join('bears', 'upload'),
+                bear_file_name,
+                bear_name, 'pypi') if not args.conda else\
+                create_file_structure_for_packages(
+                args.conda,
+                bear_file_name,
+                bear_name, 'conda')
             bear_version = VERSION
             if 'dev' in bear_version:  # pragma: no cover
                 bear_version = bear_version[:bear_version.find("dev")] + (
@@ -129,10 +176,12 @@ def main():
                                  'PLATFORMS': str(bear_object.PLATFORMS),
                                  'LICENSE': str(bear_object.LICENSE),
                                  'LONG_DESCRIPTION': str(bear_object.__doc__)}
-
-            create_file_from_template(os.path.join('bears', 'setup.py.in'),
+            template_dir = os.path.join('bears', 'templates')
+            create_file_from_template(os.path.join(template_dir, 'setup.py.in'),
                                       os.path.join('bears', 'upload',
-                                                   bear_name, 'setup.py'),
+                                                   bear_name, 'setup.py') if not
+                                      args.conda else os.path.join(args.conda,
+                                                                   'setup.py'),
                                       substitution_dict)
 
             bear_dist_name = bear_name + '-' + bear_version
@@ -141,6 +190,25 @@ def main():
                                  bear_dist_name)
             if args.upload:
                 perform_upload(os.path.join('bears', 'upload', bear_name))
+
+            if args.conda:
+                substitution_dict['URL'] = fetch_url(args.conda) or\
+                    ask_question('Repository URL was not found.' +
+                                 ' Please submit it manually', typecast=str)
+                # conda accepts only lowercase package names
+                substitution_dict['NAME'] = substitution_dict['NAME'].lower()
+                create_file_from_template(os.path.join(template_dir,
+                                                       'meta.yaml.in'),
+                                          os.path.join(args.conda, 'meta.yaml'),
+                                          substitution_dict)
+                with open(os.path.join(template_dir, 'build.sh'), 'r') as f_in:
+                    f_out = open(os.path.join(args.conda, 'build.sh'), 'w')
+                    f_out.write(f_in.read())
+                    f_out.close()
+                with open(os.path.join(template_dir, 'bld.bat'), 'r') as f_in:
+                    f_out = open(os.path.join(args.conda, 'bld.bat'), 'w')
+                    f_out.write(f_in.read())
+                    f_out.close()
 
 
 if __name__ == '__main__':  # pragma: no cover
